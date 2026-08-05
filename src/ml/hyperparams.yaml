@@ -1,0 +1,38 @@
+training:
+  model_name: meta-llama/Llama-3.1-8B-Instruct
+  base_model: meta-llama/Llama-3.1-8B-Instruct
+  method: lora
+  epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_seq_length: 4096
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+    - k_proj
+    - o_proj
+  optim: adamw_torch
+  bf16: true
+  gradient_checkpointing: true
+  seed: 42
+
+evaluation:
+  metrics:
+    - rouge
+    - bertscore
+    - exact_match
+  eval_steps: 100
+  save_steps: 200
+
+data:
+  train_file: data/datasets/customer_support_v3.parquet
+  val_file: data/datasets/customer_support_val.parquet
+  test_file: data/datasets/customer_support_test.parquet
+  max_samples: 50000

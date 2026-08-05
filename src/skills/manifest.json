@@ -1,0 +1,54 @@
+{
+  "skills": [
+    {
+      "name": "ticket_triage",
+      "description": "Classify and prioritize incoming support tickets using few-shot classification",
+      "version": "1.2.0",
+      "entrypoint": "src.skills.ticket_triage:run",
+      "inputs": {
+        "text": {"type": "string", "required": true},
+        "customer_tier": {"type": "string", "enum": ["free", "pro", "enterprise"]}
+      },
+      "outputs": {
+        "category": "string",
+        "priority": "string",
+        "confidence": "number"
+      },
+      "permissions": ["read:crm", "write:ticket"],
+      "model": "gpt-4o-mini"
+    },
+    {
+      "name": "kb_summarizer",
+      "description": "Summarize multiple knowledge-base articles into a single answer with citations",
+      "version": "2.0.1",
+      "entrypoint": "src.skills.kb_summarizer:run",
+      "inputs": {
+        "query": {"type": "string"},
+        "max_articles": {"type": "integer", "default": 5}
+      },
+      "outputs": {
+        "summary": "string",
+        "citations": "array"
+      },
+      "permissions": ["read:kb"],
+      "model": "gpt-4o"
+    },
+    {
+      "name": "code_diagnosis",
+      "description": "Analyze stack traces and suggest fixes using code interpreter + retrieval",
+      "version": "0.9.3",
+      "entrypoint": "src.skills.code_diagnosis:run",
+      "inputs": {
+        "stack_trace": {"type": "string"},
+        "language": {"type": "string", "default": "python"}
+      },
+      "outputs": {
+        "diagnosis": "string",
+        "suggested_fix": "string",
+        "confidence": "number"
+      },
+      "permissions": ["read:codebase", "execute:sandbox"],
+      "model": "claude-3-5-sonnet-20241022"
+    }
+  ]
+}

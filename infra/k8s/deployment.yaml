@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-agent-platform
+  labels:
+    app: rag-agent
+    ai.component: agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rag-agent
+  template:
+    metadata:
+      labels:
+        app: rag-agent
+      annotations:
+        ai.model: gpt-4o-2024-08-06
+        ai.embedding: text-embedding-3-large
+        ai.vectorstore: pinecone
+    spec:
+      containers:
+        - name: agent
+          image: contoso/rag-agent-platform:2.4.1
+          ports:
+            - containerPort: 8000
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-secrets
+                  key: openai-api-key
+            - name: MODEL_NAME
+              value: "gpt-4o-2024-08-06"
+            - name: EMBEDDING_MODEL
+              value: "text-embedding-3-large"
+            - name: VECTOR_STORE_URI
+              value: "https://pinecone-index.svc.us-east-1.pinecone.io"
+            - name: MCP_SERVER_URL
+              value: "http://mcp-server:8080/mcp"
+            - name: MLFLOW_TRACKING_URI
+              value: "http://mlflow.ml.svc:5000"
+            - name: LANGFUSE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-secrets
+                  key: langfuse-public
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-agent
+spec:
+  selector:
+    app: rag-agent
+  ports:
+    - port: 80
+      targetPort: 8000
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ai-secrets
+type: Opaque
+stringData:
+  openai-api-key: "sk-proj-dummy-openai-key-for-aibom-scan-test"
+  anthropic-api-key: "sk-ant-api03-dummy-anthropic-key"
+  langfuse-public: "pk-lf-dummy"
+  langfuse-secret: "sk-lf-dummy"

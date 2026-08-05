@@ -1,0 +1,23 @@
+max_risk_score: 50
+blocked_component_types: []
+required_component_types:
+  - guardrail
+  - secret
+required_fields:
+  - name
+  - component_type
+rules:
+  - name: no-hardcoded-openai-keys
+    description: Fail if plaintext OpenAI keys are detected outside .env
+    match:
+      component_type: secret
+      name_contains: sk-proj
+    action: fail
+  - name: require-guardrails-on-agents
+    description: Every agent must have an associated guardrail relationship
+    match:
+      component_type: agent
+    require_relationship:
+      type: uses
+      target_type: guardrail
+    action: warn

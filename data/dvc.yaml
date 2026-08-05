@@ -1,0 +1,31 @@
+stages:
+  prepare:
+    cmd: python src/ml/prepare_data.py
+    deps:
+      - data/raw/tickets_export.csv
+      - src/ml/prepare_data.py
+    outs:
+      - data/datasets/customer_support_v3.parquet
+      - data/datasets/customer_support_val.parquet
+      - data/datasets/customer_support_test.parquet
+
+  train:
+    cmd: python src/ml/train.py
+    deps:
+      - data/datasets/customer_support_v3.parquet
+      - src/ml/train.py
+      - src/ml/hyperparams.yaml
+    outs:
+      - data/artifacts/lora-llama31-8b/final
+    metrics:
+      - data/artifacts/metrics.json
+    params:
+      - src/ml/hyperparams.yaml
+
+  evaluate:
+    cmd: python src/ml/evaluate.py
+    deps:
+      - data/artifacts/lora-llama31-8b/final
+      - data/datasets/customer_support_test.parquet
+    metrics:
+      - data/artifacts/eval_metrics.json
