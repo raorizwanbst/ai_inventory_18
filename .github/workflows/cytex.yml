@@ -30,8 +30,8 @@ jobs:
       AIBOM_VERSION: 1.0.9
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
       AIBOM_LLM_PROVIDER: groq
-      AIBOM_LLM_MODEL: openai/gpt-oss-120b
-      AIBOM_FAST_MODEL: openai/gpt-oss-20b
+      AIBOM_LLM_MODEL: groq/compound
+      AIBOM_FAST_MODEL: groq/compound-mini
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -93,7 +93,7 @@ jobs:
           timeout 600 cisco-aibom analyze "$SCAN_DIR" \
             -o cyclonedx -O "$REPORT_DIR/$AIBOM_REPORT" \
             --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" --llm-api-key "$AIBOM_LLM_API_KEY" \
-            --agentic-fast-model "$AIBOM_FAST_MODEL" --severity info \
+            --agentic-fast-model "$AIBOM_FAST_MODEL" --severity info --agentic-review-secrets \
             --agentic-batch-size 3 --agentic-concurrency 1 --agentic-timeout 120 \
             --compliance all --timing --validate --show-summary 2>&1 | tee "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
           AIBOM_STATUS=${PIPESTATUS[0]}
