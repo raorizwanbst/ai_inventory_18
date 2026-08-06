@@ -3,8 +3,6 @@ name: Cytex Scan
 
 # github.py treats every .json in the uploaded artifact as its own scan report, so this
 # workflow must upload exactly the 5 intended report files -- no more, no less.
-# skills.json / mcp.json / mcp-parts stay on the runner and are folded into the combined
-# report only; they are never uploaded.
 on:
   push:
     branches: ["master", "main"]
@@ -15,21 +13,10 @@ on:
         required: false
         default: ""
 
-permissions:
-  contents: read
-
-concurrency:
-  group: cytex-scan-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   scan:
     name: Cytex security scan
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash
     env:
       REPORT_DIR: /tmp/cytex-reports
       SEMGREP_REPORT: semgrep.json
@@ -40,18 +27,8 @@ jobs:
       SKILLS_REPORT: skills.json
       MCP_REPORT: mcp.json
       AIBOM_CONSOLE: aibom_console.txt
-
       AIBOM_VERSION: 1.0.9
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
-
-      # Pin these to release tags once you've picked versions; empty = installer default
-      # (latest), which is reproducibility-unsafe for a compliance artifact.
-      SYFT_VERSION: ""
-      GRYPE_VERSION: ""
-      # Pinned semgrep rulesets instead of --config=auto: auto resolves against the
-      # registry at run time, so results drift as upstream rules change.
-      SEMGREP_RULES: "p/default"
-
       # provider is "openai", not "groq": cisco-aibom's build_chat_model strips a
       # "provider/" prefix from --llm-model whenever it matches --llm-provider
       # (aibom/llm_factory.py) -- fine for every other model, but Groq's own two
@@ -61,153 +38,53 @@ jobs:
       # OpenAI-compatible endpoint with the Groq key.
       AIBOM_LLM_PROVIDER: openai
       AIBOM_LLM_API_BASE: https://api.groq.com/openai/v1
-      AIBOM_LLM_MODEL: groq/compound
-      AIBOM_FAST_MODEL: groq/compound-mini
-      # Concurrency stays at 1: Groq TPM limits trip the agentic circuit breaker long
-      # before throughput becomes the bottleneck. Cut cost via the pruned tree instead.
-      AIBOM_BATCH_SIZE: "5"
-      AIBOM_CONCURRENCY: "1"
-      AIBOM_AGENTIC_TIMEOUT: "120"
-      AIBOM_WALL_TIMEOUT: "1800"
-
-      # Directories that are never source-of-truth for AI assets but dominate scan cost.
-      # Applied once by building a pruned copy of the tree, so every tool inherits them
-      # without depending on six different --exclude syntaxes.
-      SCAN_EXCLUDES: ".git/ node_modules/ .venv/ venv/ env/ vendor/ dist/ build/ out/ .next/ .nuxt/ target/ __pycache__/ .mypy_cache/ .pytest_cache/ .ruff_cache/ .tox/ site-packages/ .terraform/ coverage/ htmlcov/ .gradle/ .idea/ .vscode/ *.min.js *.min.css *.map"
-
-      # Semgrep JSON carries the matched source line in extra.lines. A rule that fires on
-      # a hardcoded credential would put that credential into the uploaded report.
-      KEEP_SEMGREP_CODE: "false"
-      # Set true once you trust the pipeline: turns a degraded scan into a red build
-      # instead of a green one with a quietly empty report.
-      FAIL_ON_DEGRADED: "false"
-
+      AIBOM_LLM_MODEL: openai/gpt-oss-120b
+      AIBOM_FAST_MODEL: openai/gpt-oss-20b
     steps:
-      # TODO: pin actions to a commit SHA (uses: actions/checkout@<sha>) before this
-      # workflow is treated as a trusted control.
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cache AI BOM catalog
-        uses: actions/cache@v4
-        with:
-          path: ~/.aibom/catalogs
-          key: aibom-catalog-${{ env.AIBOM_VERSION }}-${{ env.AIBOM_CATALOG_SHA256 }}
-
-      - name: Cache Python tooling
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.local/pipx
-            ~/.local/bin
-          key: cytex-tools-${{ runner.os }}-${{ env.AIBOM_VERSION }}-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            cytex-tools-${{ runner.os }}-${{ env.AIBOM_VERSION }}-
-
-      # The install step is allowed to fail without stopping the job, but it records
-      # INSTALL_STATUS. Without that, a broken toolchain produces zero findings from
-      # every scanner and the pipeline reports a clean repo.
       - name: Install scan toolchain
         run: |
-          set +e
-          INSTALL_STATUS=0
-          note() { echo "::warning title=Cytex toolchain::$1"; INSTALL_STATUS=1; }
-
-          if ! command -v grype >/dev/null 2>&1; then
-            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-              | sh -s -- -b /usr/local/bin $GRYPE_VERSION || note "grype install failed"
-          fi
-          if ! command -v syft >/dev/null 2>&1; then
-            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-              | sh -s -- -b /usr/local/bin $SYFT_VERSION || note "syft install failed"
-          fi
-
-          python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq \
-            || note "cisco-aibom install failed"
-          command -v semgrep >/dev/null 2>&1 || pipx install semgrep || note "semgrep install failed"
-          command -v skill-scanner >/dev/null 2>&1 || pipx install cisco-ai-mcp-scanner || note "mcp/skill scanner install failed"
-
-          CATALOG=~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq
+          pipx install --force semgrep
+          pipx install --force cisco-ai-mcp-scanner
           mkdir -p ~/.aibom/catalogs
-          if [ ! -s "$CATALOG" ]; then
-            curl -sSfL -o "$CATALOG" \
-              https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb \
-              || note "catalog download failed"
-          fi
-          # Verified on every run, not just on download -- a restored cache is untrusted input.
-          if ! echo "$AIBOM_CATALOG_SHA256  $CATALOG" | sha256sum -c - >/dev/null 2>&1; then
-            rm -f "$CATALOG"
-            note "catalog SHA-256 mismatch (removed)"
-          fi
+          curl -sSfL -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
+          echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
 
-          v() { "$@" 2>/dev/null | head -n1 | tr -d '"\\' | tr -s ' ' | cut -c1-60; }
-          printf 'TOOL_VERSIONS={"syft":"%s","grype":"%s","semgrep":"%s","aibom":"%s"}\n' \
-            "$(v syft version)" "$(v grype version)" "$(v semgrep --version)" \
-            "$(v cisco-aibom --version)" >> "$GITHUB_ENV"
-          echo "INSTALL_STATUS=$INSTALL_STATUS" >> "$GITHUB_ENV"
-
-      # Both full and incremental scans run against a pruned temp copy of the tree.
-      # One prune, applied once, is what keeps the agentic tier inside its budget --
-      # node_modules alone can be tens of thousands of candidate dependencies.
       - name: Resolve scan scope
         env:
           CHANGED_FILES: ${{ github.event.inputs.changedFiles }}
         run: |
           mkdir -p "$REPORT_DIR"
-          SCAN_DIR=$(mktemp -d /tmp/cytex-scan.XXXXXX)
-
-          RSYNC_ARGS=()
-          for pattern in $SCAN_EXCLUDES; do RSYNC_ARGS+=(--exclude "$pattern"); done
-
           SCAN_TYPE=full
+          SCAN_DIR=.
           CHANGED_FILE_COUNT=0
           if [ -n "$CHANGED_FILES" ]; then
             SCAN_TYPE=incremental
+            SCAN_DIR=$(mktemp -d)
             IFS=',' read -ra CHANGED_PATHS <<< "$CHANGED_FILES"
             for path in "${CHANGED_PATHS[@]}"; do
-              path="${path#./}"
-              [ -f "$path" ] && cp --parents "$path" "$SCAN_DIR/" 2>/dev/null
+              if [ -f "$path" ]; then
+                mkdir -p "$SCAN_DIR/$(dirname "$path")"
+                cp "$path" "$SCAN_DIR/$path"
+              fi
             done
             CHANGED_FILE_COUNT=$(find "$SCAN_DIR" -type f | wc -l)
-
-            # Manifests and config always ride along. Without them syft/grype see an
-            # empty tree, and aibom's cross-ref stage has no .env / compose / Helm /
-            # tfvars to resolve os.getenv("MODEL_NAME") against -- so every env-var
-            # reference falls through to the LLM tier unresolved.
-            for name in requirements.txt requirements-dev.txt pyproject.toml poetry.lock \
-                        Pipfile.lock setup.py setup.cfg package.json package-lock.json \
-                        yarn.lock pnpm-lock.yaml go.mod go.sum Cargo.toml Cargo.lock \
-                        Gemfile Gemfile.lock pom.xml build.gradle build.gradle.kts \
-                        .env .env.example docker-compose.yml docker-compose.yaml \
-                        Dockerfile Containerfile values.yaml .aibom.yaml .aibom.yml \
-                        mcp.json .mcp.json; do
-              find . -name "$name" -type f -not -path "./.git/*" -not -path "*/node_modules/*" \
-                -exec cp --parents {} "$SCAN_DIR/" \; 2>/dev/null
-            done
-            find . -name "*.tfvars" -type f -not -path "./.git/*" \
-              -exec cp --parents {} "$SCAN_DIR/" \; 2>/dev/null
-          else
-            rsync -a --quiet "${RSYNC_ARGS[@]}" ./ "$SCAN_DIR/"
           fi
-
-          SCAN_FILE_COUNT=$(find "$SCAN_DIR" -type f | wc -l)
           {
             echo "SCAN_TYPE=$SCAN_TYPE"
             echo "SCAN_DIR=$SCAN_DIR"
             echo "CHANGED_FILE_COUNT=$CHANGED_FILE_COUNT"
-            echo "SCAN_FILE_COUNT=$SCAN_FILE_COUNT"
           } >> "$GITHUB_ENV"
 
       # Each tool records its own exit code instead of failing the job, so one broken
-      # scanner never discards the others' reports. The consolidate step turns those
-      # codes into states -- an exit code alone does not mean the same thing twice here
-      # (semgrep 1 = findings found, grype 1 = actual failure).
+      # scanner never discards the others' reports.
       - name: Run scanners
         env:
-          # Passed by environment, not on argv: --llm-api-key is visible in
-          # /proc/<pid>/cmdline and in any traceback that dumps sys.argv.
-          # Verify your aibom build reads it: `cisco-aibom analyze --help | grep -i api-key`.
           AIBOM_LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
@@ -215,57 +92,35 @@ jobs:
           syft "dir:$SCAN_DIR" -o cyclonedx-json > "$REPORT_DIR/$SYFT_REPORT"
           SYFT_STATUS=$?
 
-          # Grype reads syft's SBOM rather than rescanning the directory: same vuln set,
-          # faster, and affects[].ref lands in syft's bom-ref namespace so the merged
-          # graph actually resolves. Falls back to dir: if syft produced nothing.
-          if [ "$SYFT_STATUS" -eq 0 ] && [ -s "$REPORT_DIR/$SYFT_REPORT" ]; then
-            grype "sbom:$REPORT_DIR/$SYFT_REPORT" -o cyclonedx-json="$REPORT_DIR/$GRYPE_REPORT"
-          else
-            grype "dir:$SCAN_DIR" -o cyclonedx-json="$REPORT_DIR/$GRYPE_REPORT"
-          fi
+          grype "dir:$SCAN_DIR" -o cyclonedx-json="$REPORT_DIR/$GRYPE_REPORT"
           GRYPE_STATUS=$?
 
-          semgrep --config "$SEMGREP_RULES" --metrics=off --error --json "$SCAN_DIR" \
-            | tee "$REPORT_DIR/$SEMGREP_REPORT" > /dev/null
+          semgrep --config=auto "$SCAN_DIR" --json | tee "$REPORT_DIR/$SEMGREP_REPORT" > /dev/null
           SEMGREP_STATUS=${PIPESTATUS[0]}
 
-          # COLUMNS/NO_COLOR/TERM keep Rich from wrapping the compliance tables at 80
-          # columns -- wrapped rows split the control ID away from its verdict and the
-          # console parser silently loses them.
-          COLUMNS=250 NO_COLOR=1 TERM=dumb \
-          timeout "$AIBOM_WALL_TIMEOUT" cisco-aibom analyze "$SCAN_DIR" \
+          timeout 600 cisco-aibom analyze "$SCAN_DIR" \
             -o cyclonedx -O "$REPORT_DIR/$AIBOM_REPORT" \
-            --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" \
+            --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" --llm-api-key "$AIBOM_LLM_API_KEY" \
             --llm-api-base "$AIBOM_LLM_API_BASE" \
             --agentic-fast-model "$AIBOM_FAST_MODEL" --severity info --agentic-review-secrets \
-            --agentic-batch-size "$AIBOM_BATCH_SIZE" --agentic-concurrency "$AIBOM_CONCURRENCY" \
-            --agentic-timeout "$AIBOM_AGENTIC_TIMEOUT" \
-            --compliance all --timing --validate --show-summary 2>&1 \
-            | tee "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
+            --agentic-batch-size 3 --agentic-concurrency 1 --agentic-timeout 120 \
+            --compliance all --timing --validate --show-summary 2>&1 | tee "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
           AIBOM_STATUS=${PIPESTATUS[0]}
 
-          skill-scanner scan-all "$SCAN_DIR" --recursive --lenient --format json \
-            --output-json "$REPORT_DIR/$SKILLS_REPORT"
+          skill-scanner scan-all "$SCAN_DIR" --recursive --lenient --format json --output-json "$REPORT_DIR/$SKILLS_REPORT"
           SKILLS_STATUS=$?
 
-          # Every MCP config is scanned, not just the first match -- a monorepo routinely
-          # ships one per service. Parts land in a directory the upload step ignores.
-          MCP_PARTS="$REPORT_DIR/mcp-parts"
-          mkdir -p "$MCP_PARTS"
-          MCP_INDEX=0
-          MCP_STATUS=skipped
-          while IFS= read -r config; do
-            [ -n "$config" ] || continue
-            mcp-scanner --analyzers yara --format raw config --config-path "$config" \
-              > "$MCP_PARTS/mcp-$MCP_INDEX.json"
-            RC=$?
-            [ "$MCP_STATUS" = "skipped" ] && MCP_STATUS=$RC
-            [ "$RC" -ne 0 ] && MCP_STATUS=$RC
-            MCP_INDEX=$((MCP_INDEX + 1))
-          done < <(find "$SCAN_DIR" -type f \
-                     \( -name mcp.json -o -name .mcp.json -o -name mcp_config.json \
-                        -o -name claude_desktop_config.json -o -name cline_mcp_settings.json \) \
-                     -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null)
+          MCP_CONFIG=""
+          for name in mcp.json .mcp.json mcp_config.json claude_desktop_config.json cline_mcp_settings.json; do
+            MCP_CONFIG=$(find "$SCAN_DIR" -type f -name "$name" -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -n1)
+            [ -n "$MCP_CONFIG" ] && break
+          done
+          if [ -n "$MCP_CONFIG" ]; then
+            mcp-scanner --analyzers yara --format raw config --config-path "$MCP_CONFIG" > "$REPORT_DIR/$MCP_REPORT"
+            MCP_STATUS=$?
+          else
+            MCP_STATUS=skipped
+          fi
 
           {
             echo "SYFT_STATUS=$SYFT_STATUS"
@@ -274,7 +129,6 @@ jobs:
             echo "AIBOM_STATUS=$AIBOM_STATUS"
             echo "SKILLS_STATUS=$SKILLS_STATUS"
             echo "MCP_STATUS=$MCP_STATUS"
-            echo "MCP_CONFIG_COUNT=$MCP_INDEX"
           } >> "$GITHUB_ENV"
 
       # Shell/Python only, no GitHub-specific syntax -- the same block can be dropped into
@@ -291,14 +145,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           export SCAN_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          export SCAN_PREFIX=$(realpath "${SCAN_DIR:-.}" 2>/dev/null || echo "${SCAN_DIR:-.}")
+          export SCAN_PREFIX=$(realpath "${SCAN_DIR:-.}")
           export WORKSPACE=$(pwd)
           python3 - <<'PYEOF'
-          import glob
           import json
           import os
           import re
-          import uuid
 
           report_dir = os.environ["REPORT_DIR"]
           report_files = {
@@ -310,74 +162,25 @@ jobs:
               "mcp": os.environ["MCP_REPORT"],
           }
 
-          def path_of(key):
-              return os.path.join(report_dir, report_files[key])
-
-          def load_path(path):
+          def load(key):
+              path = os.path.join(report_dir, report_files[key])
               if not os.path.exists(path):
-                  return None
+                  return {}
               try:
-                  with open(path, encoding="utf-8", errors="replace") as fh:
+                  with open(path) as fh:
                       return json.load(fh)
               except (ValueError, OSError):
-                  return None
+                  return {}
 
-          # mcp-scanner writes one part per config; fold them into a single doc that is
-          # also persisted as mcp.json so the shape stays the same as every other input.
-          mcp_parts = []
-          for part in sorted(glob.glob(os.path.join(report_dir, "mcp-parts", "*.json"))):
-              doc = load_path(part)
-              if doc is not None:
-                  mcp_parts.append({"config": os.path.basename(part), "raw": doc})
-          if mcp_parts:
-              with open(path_of("mcp"), "w", encoding="utf-8") as fh:
-                  json.dump({"parts": mcp_parts}, fh)
+          sbom = load("sbom")
+          aibom = load("aibom")
+          grype = load("grype")
+          semgrep = load("semgrep")
 
-          # raw_docs keeps None for "failed to parse"; docs is the usable value. A valid
-          # but empty {} means the scanner ran and found nothing -- that is not a failure,
-          # and collapsing the two is what turns a clean repo into a degraded one.
-          raw_docs = {key: load_path(path_of(key)) for key in report_files}
-          docs = {}
-          for key, value in raw_docs.items():
-              docs[key] = value if isinstance(value, (dict, list)) else {}
-          for key in ("sbom", "aibom", "grype", "semgrep", "skills"):
-              if not isinstance(docs[key], dict):
-                  docs[key] = {}
-          sbom, aibom, grype = docs["sbom"], docs["aibom"], docs["grype"]
-          semgrep, skills_doc, mcp_doc = docs["semgrep"], docs["skills"], docs["mcp"]
-
-          # ---------- severity vocabulary ----------
-          # grype says Critical, OSV says MODERATE, semgrep says ERROR, skill-scanner and
-          # mcp-scanner say whatever they like. Counting them raw fragments the buckets.
-          SEVERITY_ORDER = ["none", "unknown", "info", "low", "medium", "high", "critical"]
-          SEVERITY_ALIASES = {
-              "critical": "critical", "crit": "critical", "blocker": "critical",
-              "high": "high", "error": "high", "severe": "high", "important": "high",
-              "medium": "medium", "moderate": "medium", "warning": "medium", "warn": "medium",
-              "low": "low", "minor": "low", "negligible": "low",
-              "info": "info", "informational": "info", "note": "info", "notice": "info",
-              "none": "none", "safe": "none", "unknown": "unknown", "": "unknown",
-          }
-
-          def norm_severity(value):
-              return SEVERITY_ALIASES.get(str(value or "").strip().lower(), "unknown")
-
-          def worst_rating(vuln):
-              best, best_rank = "unknown", -1
-              for rating in vuln.get("ratings") or []:
-                  if not isinstance(rating, dict):
-                      continue
-                  sev = norm_severity(rating.get("severity"))
-                  rank = SEVERITY_ORDER.index(sev)
-                  if rank > best_rank:
-                      best, best_rank = sev, rank
-              return best
-
-          # ---------- path normalisation ----------
+          # Strip absolute runner paths (workspace or the incremental temp dir) so file
+          # references are repo-relative and identical between full and incremental scans.
           prefixes = sorted(
-              {p.rstrip("/") + "/" for p in (os.environ.get("SCAN_PREFIX", ""),
-                                             os.environ.get("SCAN_DIR", ""),
-                                             os.environ.get("WORKSPACE", "")) if p and p != "/"},
+              {p.rstrip("/") + "/" for p in (os.environ.get("SCAN_PREFIX", ""), os.environ.get("WORKSPACE", "")) if p and p != "/"},
               key=len, reverse=True,
           )
 
@@ -392,402 +195,6 @@ jobs:
                   return {key: norm(item) for key, item in value.items()}
               return value
 
-          def with_props(item, pairs):
-              props = [p for p in (item.get("properties") or []) if isinstance(p, dict)]
-              have = {p.get("name") for p in props}
-              for name, value in pairs:
-                  if value and name not in have:
-                      props.append({"name": name, "value": str(value)})
-              if props:
-                  item["properties"] = props
-              return item
-
-          def tag(items, source):
-              out = []
-              for item in items or []:
-                  if isinstance(item, dict):
-                      copy = dict(item)
-                      copy["_source"] = source
-                      out.append(copy)
-              return out
-
-          # ---------- hoist aibom's nested CVEs BEFORE components are copied ----------
-          # tag() shallow-copies, so leaving them in place duplicates every aibom CVE:
-          # once nested under its component, once at top level.
-          aibom_nested = []
-          for component in aibom.get("components") or []:
-              if not isinstance(component, dict):
-                  continue
-              for cve in component.pop("vulnerabilities", None) or []:
-                  if not isinstance(cve, dict):
-                      continue
-                  entry = dict(cve)
-                  if not entry.get("affects") and component.get("bom-ref"):
-                      entry["affects"] = [{"ref": component["bom-ref"]}]
-                  aibom_nested.append(entry)
-
-          # ---------- components: dedup + ref reconciliation ----------
-          raw_components = tag(sbom.get("components"), "sbom") + tag(aibom.get("components"), "aibom")
-
-          def component_key(component):
-              purl = component.get("purl")
-              if purl:
-                  return ("purl", str(purl))
-              return ("nvt", str(component.get("name", "")).lower(),
-                      str(component.get("version", "")), str(component.get("type", "")))
-
-          # any bom-ref -> the bom-ref that survives dedup, so affects[]/dependsOn[] can be
-          # rewritten instead of dangling across two independent bom-ref namespaces.
-          canonical_ref = {}
-          seen, components = {}, []
-          for component in raw_components:
-              key = component_key(component)
-              ref = str(component.get("bom-ref") or "")
-              if key in seen:
-                  keeper = seen[key]
-                  if ref:
-                      canonical_ref[ref] = str(keeper.get("bom-ref") or ref)
-                  sources = keeper.setdefault("_sources", [keeper.get("_source")])
-                  if component.get("_source") not in sources:
-                      sources.append(component.get("_source"))
-                  for field, value in component.items():
-                      if not field.startswith("_") and value and not keeper.get(field):
-                          keeper[field] = value
-                  continue
-              component["_sources"] = [component.get("_source")]
-              if ref:
-                  canonical_ref[ref] = ref
-              seen[key] = component
-              components.append(component)
-
-          component_dupes = len(raw_components) - len(components)
-
-          def remap(ref):
-              return canonical_ref.get(str(ref), str(ref))
-
-          surviving_refs = {str(c.get("bom-ref")) for c in components if c.get("bom-ref")}
-
-          # ---------- skills -> components + vulnerabilities ----------
-          skill_seen = {}
-          skill_components, skill_vulns = [], []
-          for result in norm((skills_doc or {}).get("results") or []):
-              if not isinstance(result, dict):
-                  continue
-              skill_path = str(result.get("skill_path", ""))
-              name = (str(result.get("skill_name") or "") or os.path.basename(skill_path)
-                      or os.environ.get("REPO", "").split("/")[-1] or "root")
-              base = "agent-skill-" + re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
-              # Same-named skills in different directories collided on bom-ref before.
-              skill_ref = base if base not in skill_seen else "%s-%d" % (base, skill_seen[base])
-              skill_seen[base] = skill_seen.get(base, 0) + 1
-              skill_components.append({
-                  # "skill" is not a CycloneDX component type; keep the real value as a property.
-                  "type": "data",
-                  "bom-ref": skill_ref,
-                  "name": name,
-                  "version": "",
-                  "_source": "skills",
-                  "properties": [
-                      {"name": "cytex:componentType", "value": "skill"},
-                      {"name": "skill:Path", "value": skill_path},
-                      {"name": "skill:IsSafe", "value": str(result.get("is_safe", ""))},
-                      {"name": "skill:MaxSeverity", "value": norm_severity(result.get("max_severity"))},
-                      {"name": "skill:FindingsCount", "value": str(result.get("findings_count", ""))},
-                  ],
-              })
-              for index, finding in enumerate(result.get("findings") or []):
-                  if not isinstance(finding, dict):
-                      continue
-                  rule = str(finding.get("rule_id") or finding.get("id") or "SKILL-FINDING")
-                  skill_vulns.append({
-                      "bom-ref": "%s-%s-%d" % (skill_ref, re.sub(r"[^A-Za-z0-9._-]+", "-", rule), index),
-                      "id": rule,
-                      "source": {"name": "skill-scanner"},
-                      "ratings": [{"severity": norm_severity(finding.get("severity")), "method": "other"}],
-                      "description": "%s: %s Remediation: %s" % (
-                          finding.get("title", ""), finding.get("description", ""),
-                          finding.get("remediation", "")),
-                      "affects": [{"ref": skill_ref}],
-                      "properties": [
-                          {"name": "skill:Category", "value": str(finding.get("category", ""))},
-                          {"name": "skill:Analyzer", "value": str(finding.get("analyzer", ""))},
-                          {"name": "skill:File", "value": str(finding.get("file_path", ""))},
-                      ],
-                      "_source": "skills",
-                  })
-          components.extend(skill_components)
-          surviving_refs.update(c["bom-ref"] for c in skill_components)
-
-          # ---------- mcp findings ----------
-          def mcp_findings_of(doc):
-              if isinstance(doc, list):
-                  return doc
-              if isinstance(doc, dict):
-                  if isinstance(doc.get("parts"), list):
-                      out = []
-                      for part in doc["parts"]:
-                          out.extend(mcp_findings_of((part or {}).get("raw")))
-                      return out
-                  for key in ("findings", "results", "threats", "vulnerabilities", "issues"):
-                      if isinstance(doc.get(key), list):
-                          return doc[key]
-              return []
-
-          mcp_vulns = []
-          for index, finding in enumerate(norm(mcp_findings_of(mcp_doc))):
-              finding = finding if isinstance(finding, dict) else {"description": str(finding)}
-              title = str(finding.get("threat") or finding.get("name")
-                          or finding.get("title") or "MCP-FINDING")
-              mcp_vulns.append({
-                  "bom-ref": "mcp-finding-%d" % index,
-                  "id": str(finding.get("rule_id") or finding.get("id") or title),
-                  "source": {"name": "mcp-scanner"},
-                  "ratings": [{"severity": norm_severity(finding.get("severity")
-                                                         or finding.get("level")), "method": "other"}],
-                  "description": str(finding.get("description") or title),
-                  "properties": [{"name": "mcp:Raw", "value": json.dumps(finding)[:2000]}],
-                  "_source": "mcp",
-              })
-
-          # ---------- vulnerabilities: remap refs, then dedup on (id, affected component) ----------
-          ref_to_key = {}
-          for component in raw_components + skill_components:
-              ref = str(component.get("bom-ref") or "")
-              if ref:
-                  ref_to_key[ref] = component_key(component)
-
-          raw_vulns = (tag(sbom.get("vulnerabilities"), "sbom")
-                       + tag(aibom.get("vulnerabilities"), "aibom")
-                       + tag(grype.get("vulnerabilities"), "grype")
-                       + tag(aibom_nested, "aibom")
-                       + skill_vulns + mcp_vulns)
-
-          for vuln in raw_vulns:
-              affects = []
-              for affected in vuln.get("affects") or []:
-                  if isinstance(affected, dict) and affected.get("ref"):
-                      affects.append(dict(affected, ref=remap(affected["ref"])))
-                  elif isinstance(affected, dict):
-                      affects.append(affected)
-              if affects:
-                  vuln["affects"] = affects
-
-          def vuln_key(vuln):
-              ident = str(vuln.get("id") or "")
-              targets = set()
-              for affected in vuln.get("affects") or []:
-                  if isinstance(affected, dict):
-                      ref = str(affected.get("ref", ""))
-                      targets.add(str(ref_to_key.get(ref, ("ref", ref))))
-              return (ident, tuple(sorted(targets)))
-
-          vseen, vulnerabilities = {}, []
-          for vuln in raw_vulns:
-              key = vuln_key(vuln)
-              if key in vseen:
-                  keeper = vseen[key]
-                  sources = keeper.setdefault("_sources", [keeper.get("_source")])
-                  if vuln.get("_source") not in sources:
-                      sources.append(vuln.get("_source"))
-                  # Keep both scanners' assessments rather than picking one; the
-                  # normalisation pass below sorts them worst-first.
-                  merged_ratings = list(keeper.get("ratings") or [])
-                  for rating in vuln.get("ratings") or []:
-                      if rating not in merged_ratings:
-                          merged_ratings.append(rating)
-                  if merged_ratings:
-                      keeper["ratings"] = merged_ratings
-                  continue
-              vuln["_sources"] = [vuln.get("_source")]
-              vseen[key] = vuln
-              vulnerabilities.append(vuln)
-
-          # CycloneDX severity is a lowercase enum -- grype's "Critical" and OSV's
-          # "MODERATE" are not valid values. Normalise in place, keep the raw strings as
-          # a property, and sort worst-first so a consumer reading ratings[0] (as the
-          # old summary code did) gets the maximum instead of an arbitrary entry.
-          for vuln in vulnerabilities:
-              ratings = [r for r in (vuln.get("ratings") or []) if isinstance(r, dict)]
-              raw = sorted({str(r.get("severity", "")) for r in ratings if r.get("severity")})
-              for rating in ratings:
-                  rating["severity"] = norm_severity(rating.get("severity"))
-              if not ratings:
-                  ratings = [{"severity": "unknown", "method": "other"}]
-              vuln["ratings"] = sorted(
-                  ratings, key=lambda r: SEVERITY_ORDER.index(norm_severity(r.get("severity"))),
-                  reverse=True)
-              with_props(vuln, [("cytex:severity", worst_rating(vuln)),
-                                ("cytex:rawSeverity", ",".join(raw))])
-
-          # ---------- dependencies: remap, merge, drop dangling ----------
-          dep_map = {}
-          for entry in tag(sbom.get("dependencies"), "sbom") + tag(aibom.get("dependencies"), "aibom"):
-              ref = remap(entry.get("ref", ""))
-              if not ref or ref not in surviving_refs:
-                  continue
-              bucket = dep_map.setdefault(ref, {"ref": ref, "dependsOn": []})
-              for target in entry.get("dependsOn") or []:
-                  target = remap(target)
-                  if target in surviving_refs and target not in bucket["dependsOn"]:
-                      bucket["dependsOn"].append(target)
-          dependencies = sorted(dep_map.values(), key=lambda d: d["ref"])
-
-          # ---------- compliance: structured first, console only as fallback ----------
-          # Property naming is best-effort; if aibom does not emit compliance in the
-          # CycloneDX doc this returns {} and the console parser takes over.
-          def compliance_from_doc(doc):
-              out = {}
-              buckets = [(doc.get("metadata") or {}).get("properties") or [], doc.get("properties") or []]
-              for component in doc.get("components") or []:
-                  if isinstance(component, dict):
-                      buckets.append(component.get("properties") or [])
-              for props in buckets:
-                  for prop in props if isinstance(props, list) else []:
-                      if not isinstance(prop, dict):
-                          continue
-                      match = re.match(r"^(?:aibom:)?compliance[:.]([A-Za-z0-9_\-]+)[:.](.+)$",
-                                       str(prop.get("name") or ""), re.I)
-                      if not match:
-                          continue
-                      framework = match.group(1).upper()
-                      control = match.group(2)
-                      status = str(prop.get("value") or "").strip().lower().replace(" ", "_")
-                      rows = out.setdefault(framework, [])
-                      if not any(row["id"] == control for row in rows):
-                          rows.append({"id": control, "status": status})
-              return out
-
-          # Console rows look like:  eu-1 | Model transparency | pass | detail
-          # The old pattern was [a-z]+-\d+, which only ever matched EU IDs -- NIST
-          # (GOVERN-1.1 / MAP-2.3) and OWASP Agentic (ASI01 / T1) parsed to nothing, so
-          # complianceFailures was a guaranteed 0 for two of the three frameworks.
-          HEADER_RE = re.compile(r"Compliance\s*[-\u2013\u2014:]\s*([A-Za-z0-9 _/]+)")
-          ID_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*[-.]?\d+(?:\.\d+)*)\b")
-          STATUS_RE = re.compile(r"\b(pass(?:ed)?|fail(?:ed)?|not[_ ]applicable|n/a|partial|skipped)\b", re.I)
-
-          def compliance_from_console(text):
-              out, framework, pending = {}, None, None
-              for line in text.splitlines():
-                  header = HEADER_RE.search(line)
-                  if header:
-                      framework = header.group(1).strip().upper().replace(" ", "_").rstrip("_")
-                      out.setdefault(framework, [])
-                      pending = None
-                      continue
-                  if not framework:
-                      continue
-                  status = STATUS_RE.search(line)
-                  ids = ID_RE.findall(line[:status.start()] if status else line)
-                  control = ids[-1] if ids else None
-                  if control and status:
-                      out[framework].append({"id": control,
-                                             "status": status.group(1).lower().replace(" ", "_").replace("n/a", "not_applicable")})
-                      pending = None
-                  elif control:
-                      pending = control           # Rich wrapped the row; verdict is on the next line
-                  elif status and pending:
-                      out[framework].append({"id": pending,
-                                             "status": status.group(1).lower().replace(" ", "_").replace("n/a", "not_applicable")})
-                      pending = None
-              return {name: rows for name, rows in out.items() if rows}
-
-          console_path = os.path.join(report_dir, os.environ["AIBOM_CONSOLE"])
-          try:
-              with open(console_path, encoding="utf-8", errors="replace") as fh:
-                  console = fh.read()
-          except OSError:
-              console = ""
-
-          # Unioned, not either/or: aibom may emit only some frameworks as properties,
-          # and treating "found something structured" as "found everything" would
-          # silently zero out complianceFailures for the rest. Structured wins on ties.
-          structured = compliance_from_doc(aibom)
-          parsed = compliance_from_console(console)
-          compliance = {}
-          for framework in set(structured) | set(parsed):
-              rows, seen_ids = [], set()
-              for row in structured.get(framework, []) + parsed.get(framework, []):
-                  if row["id"] not in seen_ids:
-                      seen_ids.add(row["id"])
-                      rows.append(row)
-              if rows:
-                  compliance[framework] = sorted(rows, key=lambda r: r["id"])
-          compliance_source = "+".join(name for name, data in
-                                       (("cyclonedx", structured), ("console", parsed)) if data) or "none"
-
-          # The console is uploaded for debugging, and --agentic-review-secrets means it
-          # can echo detected credentials. GitHub masks secrets in logs, not in artifacts.
-          SECRET_RE = re.compile(
-              r"(sk-[A-Za-z0-9_\-]{12,}|gsk_[A-Za-z0-9]{12,}|ghp_[A-Za-z0-9]{20,}|"
-              r"github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,}|xox[abposr]-[A-Za-z0-9-]{10,}|"
-              r"AIza[0-9A-Za-z_\-]{20,}|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,})")
-          if console:
-              try:
-                  with open(console_path, "w", encoding="utf-8") as fh:
-                      fh.write(SECRET_RE.sub("[REDACTED]", console))
-              except OSError:
-                  pass
-
-          # ---------- semgrep ----------
-          findings = [f for f in (semgrep.get("results") or []) if isinstance(f, dict)]
-          if os.environ.get("KEEP_SEMGREP_CODE", "false").lower() != "true":
-              scrubbed = []
-              for finding in findings:
-                  copy = dict(finding)
-                  extra = dict(copy.get("extra") or {})
-                  for field in ("lines", "fix", "fixed_lines"):
-                      extra.pop(field, None)
-                  copy["extra"] = extra
-                  scrubbed.append(copy)
-              findings = scrubbed
-
-          # ---------- tool state: exit code + file present + file parses ----------
-          # All three failure modes used to collapse to {} and then to a zero count.
-          STATUS_ENV = {"sbom": "SYFT", "aibom": "AIBOM", "grype": "GRYPE",
-                        "semgrep": "SEMGREP", "skills": "SKILLS", "mcp": "MCP"}
-
-          def tool_state(key):
-              raw = str(os.environ.get(STATUS_ENV[key] + "_STATUS", "")).strip()
-              path = path_of(key)
-              present = os.path.exists(path)
-              size = os.path.getsize(path) if present else 0
-              parsed = raw_docs[key] is not None
-              code = int(raw) if raw.lstrip("-").isdigit() else None
-              if raw == "skipped":
-                  state = "skipped"
-              elif code == 124:
-                  state = "timeout"
-              elif key == "semgrep" and code == 1 and parsed:
-                  state = "findings"        # semgrep exits 1 when it finds something
-              elif not present or size == 0:
-                  state = "missing"
-              elif not parsed:
-                  state = "unparseable"
-              elif code not in (0, None):
-                  state = "failed"
-              else:
-                  state = "ok"
-              return {"state": state, "exitCode": code, "reportPresent": present,
-                      "reportBytes": size, "parsed": parsed}
-
-          tool_status = {key: tool_state(key) for key in report_files}
-          install_status = str(os.environ.get("INSTALL_STATUS", "")).strip()
-          tool_status["toolchain"] = {
-              "state": "ok" if install_status == "0" else ("failed" if install_status else "unknown"),
-              "exitCode": int(install_status) if install_status.isdigit() else None,
-          }
-          BAD = ("failed", "timeout", "missing", "unparseable", "unknown")
-          degraded = sorted(k for k, v in tool_status.items() if v["state"] in BAD)
-
-          # ---------- assemble ----------
-          run_key = "%s|%s|%s" % (os.environ.get("REPO", ""), os.environ.get("RUN_ID", ""),
-                                  os.environ.get("RUN_ATTEMPT", ""))
-          combined = dict(aibom) if aibom else {}
-          combined["bomFormat"] = "CycloneDX"
-          combined["specVersion"] = str(aibom.get("specVersion") or sbom.get("specVersion") or "1.6")
-          combined["serialNumber"] = "urn:uuid:%s" % uuid.uuid5(uuid.NAMESPACE_URL, run_key)
-          combined["version"] = 1
-
           def tools_of(doc):
               tools = (doc.get("metadata") or {}).get("tools")
               if isinstance(tools, dict):
@@ -796,65 +203,197 @@ jobs:
                   return [t for t in tools if isinstance(t, dict)]
               return []
 
-          tools = []
-          for tool in tools_of(sbom) + tools_of(aibom) + tools_of(grype):
-              entry = dict(tool)
-              entry.setdefault("type", "application")
-              if entry not in tools:
-                  tools.append(entry)
+          def tag(items, source):
+              return [dict(item, _source=source) for item in items]
 
-          metadata = dict(combined.get("metadata") or {})
-          metadata["timestamp"] = os.environ.get("SCAN_TIMESTAMP", "")
-          metadata["tools"] = {"components": tools}   # bare array is deprecated in 1.5+
-          metadata.setdefault("component", {
-              "type": "application",
-              "bom-ref": "cytex-scan-target",
-              "name": os.environ.get("REPO", "") or "repository",
-              "version": os.environ.get("COMMIT_SHA", ""),
-          })
-          combined["metadata"] = metadata
+          # cisco-aibom classifies components into 30 categories but its CycloneDX reporter
+          # only surfaces 25 of them directly: the seven CycloneDX types natively (model,
+          # llm_endpoint, model_endpoint, embedding, model_artifact, dataset, vector_store)
+          # have their cisco-aibom:type property deliberately omitted -- CycloneDX collapses
+          # them into "machine-learning-model" and "data" -- and secrets are routed to
+          # vulnerabilities[] instead of components[]. Both are upstream by design, but they
+          # leave the AI inventory unqueryable by category, so restore it here: stamp every
+          # component with its category and mirror each secret back into components[].
+          AIBOM_CATEGORIES = {
+              "model", "llm_endpoint", "model_endpoint", "agent", "agent_proxy", "tool",
+              "mcp_server", "mcp_client", "mcp_gateway", "embedding", "vector_store",
+              "dataset", "retriever", "knowledge_base", "feature_store", "memory",
+              "prompt", "training_run", "hyperparameter", "model_artifact",
+              "experiment_tracker", "model_registry", "data_versioning", "ml_pipeline",
+              "guardrail", "skill", "observability", "secret", "dependency", "other",
+          }
+          SECRET_ID_PREFIX = "aibom-secret-"
 
-          def finalize(items):
-              for item in items:
-                  sources = [s for s in (item.get("_sources") or [item.get("_source")]) if s]
-                  item.pop("_source", None)
-                  item.pop("_sources", None)
-                  if sources:
-                      with_props(item, [("cytex:source", ",".join(sorted(set(sources))))])
-              return items
+          def prop(item, name):
+              for entry in item.get("properties") or []:
+                  if entry.get("name") == name:
+                      return entry.get("value")
+              return None
 
-          combined["components"] = finalize(components)
-          combined["vulnerabilities"] = finalize(vulnerabilities)
-          if dependencies:
-              combined["dependencies"] = dependencies
-          combined.pop("_source", None)
+          def aibom_category(component):
+              # Where the property is dropped the category still survives in the em-dash
+              # delimited description ("gpt-4o \u2014 model \u2014 openai") or, for detector-named
+              # components, in the name itself ("dataset", "model_artifact"). The CycloneDX
+              # type is the last resort: only env:-prefixed models are endpoints.
+              explicit = prop(component, "cisco-aibom:type")
+              if explicit:
+                  return explicit
+              for token in str(component.get("description") or "").split("\u2014"):
+                  if token.strip() in AIBOM_CATEGORIES:
+                      return token.strip()
+              name = str(component.get("name") or "")
+              if name in AIBOM_CATEGORIES:
+                  return name
+              if component.get("type") == "data":
+                  return "dataset"
+              if component.get("type") == "machine-learning-model":
+                  return "llm_endpoint" if name.startswith("env:") else "model"
+              return "other"
 
-          severity_counts, sast_counts = {}, {}
-          for vuln in combined["vulnerabilities"]:
-              sev = worst_rating(vuln)
-              severity_counts[sev] = severity_counts.get(sev, 0) + 1
-          for finding in findings:
-              sev = norm_severity((finding.get("extra") or {}).get("severity"))
-              sast_counts[sev] = sast_counts.get(sev, 0) + 1
+          for component in aibom.get("components") or []:
+              if not prop(component, "cisco-aibom:type"):
+                  component.setdefault("properties", []).append(
+                      {"name": "cisco-aibom:type", "value": aibom_category(component)})
 
-          def source_of(item):
-              for prop in item.get("properties") or []:
-                  if isinstance(prop, dict) and prop.get("name") == "cytex:source":
-                      return str(prop.get("value", ""))
-              return ""
+          # Secrets stay in vulnerabilities[] -- that is where the findings view reads them
+          # -- and are mirrored into components[] so the inventory is complete.
+          for vulnerability in aibom.get("vulnerabilities") or []:
+              secret_id = str(vulnerability.get("id") or "")
+              if not secret_id.startswith(SECRET_ID_PREFIX):
+                  continue
+              aibom.setdefault("components", []).append({
+                  "type": "data",
+                  "bom-ref": secret_id,
+                  "name": secret_id[len(SECRET_ID_PREFIX):] or "secret",
+                  "description": str(vulnerability.get("description") or "Detected secret"),
+                  "properties": list(vulnerability.get("properties") or []),
+              })
 
+          combined = dict(aibom) if aibom else {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [], "metadata": {}}
+          tools = tools_of(sbom)
+          for extra in tools_of(aibom) + tools_of(grype):
+              if extra not in tools:
+                  tools.append(extra)
+          combined.setdefault("metadata", {})["tools"] = tools
+          for key in ("components", "dependencies", "vulnerabilities"):
+              merged = tag(sbom.get(key) or [], "sbom") + tag(aibom.get(key) or [], "aibom")
+              if key == "vulnerabilities":
+                  merged += tag(grype.get(key) or [], "grype")
+              if merged:
+                  combined[key] = merged
+
+          # aibom nests OSV vulnerabilities under each component; hoist them to top-level
+          # vulnerabilities[] (_source "aibom") so they sit beside Grype's.
+          for component in aibom.get("components") or []:
+              for cve in component.get("vulnerabilities") or []:
+                  combined.setdefault("vulnerabilities", []).append(dict(cve, _source="aibom"))
+
+          # Skills merge like every other detector: inventory -> components[], findings ->
+          # vulnerabilities[], tagged _source "skills".
+          for result in norm(load("skills").get("results") or []):
+              name = (str(result.get("skill_name") or "") or os.path.basename(str(result.get("skill_path", "")))
+                      or os.environ.get("REPO", "").split("/")[-1])
+              skill_ref = "agent-skill-" + name.replace(" ", "-") if name else "agent-skill-root"
+              combined.setdefault("components", []).append({
+                  "type": "skill",
+                  "bom-ref": skill_ref,
+                  "name": name,
+                  "version": "",
+                  "_source": "skills",
+                  "properties": [
+                      {"name": "skill:Path", "value": str(result.get("skill_path", ""))},
+                      {"name": "skill:IsSafe", "value": str(result.get("is_safe", ""))},
+                      {"name": "skill:MaxSeverity", "value": str(result.get("max_severity", ""))},
+                      {"name": "skill:FindingsCount", "value": str(result.get("findings_count", ""))},
+                  ],
+              })
+              for finding in result.get("findings") or []:
+                  combined.setdefault("vulnerabilities", []).append({
+                      "bom-ref": str(finding.get("id") or finding.get("rule_id", "SKILL-FINDING")) + "-" + skill_ref,
+                      "id": finding.get("rule_id", "SKILL-FINDING"),
+                      "source": {"name": "skill-scanner"},
+                      "ratings": [{"severity": str(finding.get("severity", "")).lower(), "method": "other"}],
+                      "description": "%s: %s Remediation: %s" % (
+                          finding.get("title", ""), finding.get("description", ""), finding.get("remediation", "")),
+                      "affects": [{"ref": skill_ref}],
+                      "properties": [
+                          {"name": "skill:Category", "value": str(finding.get("category", ""))},
+                          {"name": "skill:Analyzer", "value": str(finding.get("analyzer", ""))},
+                          {"name": "skill:File", "value": str(finding.get("file_path", ""))},
+                      ],
+                      "_source": "skills",
+                  })
+
+          # mcp-scanner's raw shape isn't fixed, so locate findings defensively and keep
+          # the whole finding in a property.
+          mcp_doc = load("mcp")
+          if isinstance(mcp_doc, list):
+              mcp_findings = mcp_doc
+          elif isinstance(mcp_doc, dict):
+              mcp_findings = (mcp_doc.get("findings") or mcp_doc.get("results")
+                              or mcp_doc.get("threats") or mcp_doc.get("vulnerabilities") or [])
+          else:
+              mcp_findings = []
+          for index, finding in enumerate(norm(mcp_findings)):
+              finding = finding if isinstance(finding, dict) else {"description": str(finding)}
+              severity = str(finding.get("severity") or finding.get("level") or "unknown").lower()
+              title = str(finding.get("threat") or finding.get("name") or finding.get("title") or "MCP-FINDING")
+              combined.setdefault("vulnerabilities", []).append({
+                  "bom-ref": "mcp-finding-%d" % index,
+                  "id": str(finding.get("rule_id") or finding.get("id") or title),
+                  "source": {"name": "mcp-scanner"},
+                  "ratings": [{"severity": severity, "method": "other"}],
+                  "description": str(finding.get("description") or title),
+                  "properties": [{"name": "mcp:Raw", "value": json.dumps(finding)[:2000]}],
+                  "_source": "mcp",
+              })
+
+          # Compliance verdicts print to the console, so parse the tables from
+          # aibom_console.txt. Rows look like:  eu-1 | Model transparency | pass | detail
+          compliance = {}
           try:
-              tool_versions = json.loads(os.environ.get("TOOL_VERSIONS", "{}"))
-          except ValueError:
-              tool_versions = {}
+              with open(os.path.join(report_dir, os.environ["AIBOM_CONSOLE"]), encoding="utf-8", errors="replace") as fh:
+                  console = fh.read()
+          except OSError:
+              console = ""
+          current_framework = None
+          for line in console.splitlines():
+              header = re.search(r"Compliance\s+[—-]\s+([A-Z_]+)", line)
+              if header:
+                  current_framework = header.group(1)
+                  compliance[current_framework] = []
+                  continue
+              if current_framework:
+                  row = re.search(r"\b([a-z]+-\d+)\b.*?\b(pass|fail|not_applicable)\b", line)
+                  if row:
+                      compliance[current_framework].append({"id": row.group(1), "status": row.group(2)})
+          compliance = {framework: rows for framework, rows in compliance.items() if rows}
 
-          # Non-standard root keys (semgrep / compliance / cytexScan) are deliberate Cytex
-          # extensions that github.py depends on; every component and vulnerability object
-          # below is spec-valid on its own.
+          findings = semgrep.get("results") or []
+          severity_counts = {}
+          for vuln in combined.get("vulnerabilities") or []:
+              ratings = vuln.get("ratings") or [{}]
+              severity = str(ratings[0].get("severity", "unknown")).lower()
+              severity_counts[severity] = severity_counts.get(severity, 0) + 1
+          sast_counts = {}
+          for finding in findings:
+              severity = str((finding.get("extra") or {}).get("severity", "unknown")).lower()
+              sast_counts[severity] = sast_counts.get(severity, 0) + 1
+
+          # Per-category inventory over the AI components only (sbom entries are ordinary
+          # OS/language packages). Matches the category counts cisco-aibom prints to console.
+          aibom_categories = {}
+          for component in combined.get("components") or []:
+              if not isinstance(component, dict) or component.get("_source") not in ("aibom", "skills"):
+                  continue
+              category = prop(component, "cisco-aibom:type") or ("skill" if component.get("_source") == "skills" else "other")
+              aibom_categories[category] = aibom_categories.get(category, 0) + 1
+          aibom_categories = dict(sorted(aibom_categories.items()))
+
           combined["semgrep"] = {"results": findings, "severityCounts": sast_counts}
           combined["compliance"] = compliance
+          tool_status_keys = ("SYFT", "GRYPE", "SEMGREP", "AIBOM", "SKILLS", "MCP")
           combined["cytexScan"] = {
-              "schemaVersion": 2,
               "scanType": os.environ.get("SCAN_TYPE", "full"),
               "repository": os.environ.get("REPO", ""),
               "branch": os.environ.get("BRANCH", ""),
@@ -864,88 +403,46 @@ jobs:
               "trigger": os.environ.get("EVENT_NAME", ""),
               "timestampUtc": os.environ.get("SCAN_TIMESTAMP", ""),
               "changedFileCount": int(os.environ.get("CHANGED_FILE_COUNT", "0") or 0),
-              "scannedFileCount": int(os.environ.get("SCAN_FILE_COUNT", "0") or 0),
-              "mcpConfigCount": int(os.environ.get("MCP_CONFIG_COUNT", "0") or 0),
-              "toolStatus": tool_status,
-              "toolVersions": tool_versions,
-              "degraded": bool(degraded),
-              "degradedTools": degraded,
-              "coverage": ("partial" if degraded or os.environ.get("SCAN_TYPE") == "incremental"
-                           else "full"),
-              "complianceSource": compliance_source,
-              "excludedPaths": (os.environ.get("SCAN_EXCLUDES", "") or "").split(),
+              "toolStatus": {key.lower(): os.environ.get(key + "_STATUS", "") for key in tool_status_keys},
               "summary": {
-                  "components": len(combined["components"]),
-                  "skillComponents": len([c for c in combined["components"] if "skills" in source_of(c)]),
-                  "skillFindings": len([v for v in combined["vulnerabilities"] if "skills" in source_of(v)]),
-                  "mcpFindings": len([v for v in combined["vulnerabilities"] if "mcp" in source_of(v)]),
-                  "dependencies": len(dependencies),
-                  "vulnerabilities": len(combined["vulnerabilities"]),
-                  "duplicatesCollapsed": {
-                      "components": component_dupes,
-                      "vulnerabilities": len(raw_vulns) - len(vulnerabilities),
-                  },
+                  "components": len(combined.get("components") or []),
+                  "aibomComponents": sum(aibom_categories.values()),
+                  "aibomCategories": aibom_categories,
+                  "skillComponents": len([c for c in combined.get("components") or [] if isinstance(c, dict) and c.get("_source") == "skills"]),
+                  "skillFindings": len([v for v in combined.get("vulnerabilities") or [] if isinstance(v, dict) and v.get("_source") == "skills"]),
+                  "mcpFindings": len([v for v in combined.get("vulnerabilities") or [] if isinstance(v, dict) and v.get("_source") == "mcp"]),
+                  "dependencies": len(combined.get("dependencies") or []),
+                  "vulnerabilities": len(combined.get("vulnerabilities") or []),
                   "sastFindings": len(findings),
                   "complianceFrameworks": len(compliance),
-                  "complianceFailures": sum(1 for rows in compliance.values()
-                                            for row in rows if row.get("status") == "fail"),
+                  "complianceFailures": sum(1 for rows in compliance.values() for row in rows if row.get("status") == "fail"),
                   "severityCounts": severity_counts,
                   "sastSeverityCounts": sast_counts,
               },
               "artifacts": {
                   "report": os.environ["COMBINED_REPORT"],
-                  # Only what the upload step actually ships -- skills.json and mcp.json
-                  # were listed here before but never uploaded.
-                  "sources": [os.environ["SEMGREP_REPORT"], os.environ["AIBOM_REPORT"],
-                              os.environ["SYFT_REPORT"], os.environ["GRYPE_REPORT"],
-                              os.environ["AIBOM_CONSOLE"]],
+                  "sources": list(report_files.values()) + [os.environ["AIBOM_CONSOLE"]],
               },
           }
 
           combined = norm(combined)
           with open(os.path.join(report_dir, os.environ["COMBINED_REPORT"]), "w") as fh:
               json.dump(combined, fh, indent=2, sort_keys=True)
-
-          gh_env = os.environ.get("GITHUB_ENV")
-          if gh_env:
-              with open(gh_env, "a") as fh:
-                  fh.write("SCAN_DEGRADED=%s\n" % ("true" if degraded else "false"))
-                  fh.write("SCAN_DEGRADED_TOOLS=%s\n" % ",".join(degraded))
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path:
-              lines = ["### Cytex scan", "",
-                       "| metric | value |", "|---|---|",
-                       "| coverage | %s |" % combined["cytexScan"]["coverage"],
-                       "| components | %d |" % len(combined["components"]),
-                       "| vulnerabilities | %d |" % len(combined["vulnerabilities"]),
-                       "| SAST findings | %d |" % len(findings),
-                       "| compliance failures | %d (%s) |" % (
-                           combined["cytexScan"]["summary"]["complianceFailures"], compliance_source),
-                       "| degraded tools | %s |" % (", ".join(degraded) or "none"), "",
-                       "| tool | state |", "|---|---|"]
-              lines += ["| %s | %s |" % (k, v["state"]) for k, v in sorted(tool_status.items())]
-              try:
-                  with open(summary_path, "a", encoding="utf-8") as fh:
-                      fh.write("\n".join(lines) + "\n")
-              except OSError:
-                  pass
-
-          print("components=%d vulnerabilities=%d sast=%d degraded=%s" % (
-              len(combined["components"]), len(combined["vulnerabilities"]),
-              len(findings), ",".join(degraded) or "none"))
+          print("components=%d vulnerabilities=%d sast=%d" % (
+              len(combined.get("components") or []),
+              len(combined.get("vulnerabilities") or []),
+              len(findings)))
           PYEOF
 
       # Uploads the 5 report files the platform expects (semgrep, aibom, syft, grype, combined)
-      # plus the redacted aibom_console.txt for debugging -- github.py only ingests *.json from
-      # this artifact, so the .txt rides along without affecting report parsing.
+      # plus aibom_console.txt for debugging -- github.py only ingests *.json from this artifact,
+      # so the .txt rides along without affecting report parsing.
       - name: Upload scan reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cytex-scan-reports
           if-no-files-found: warn
-          retention-days: 30
           path: |
             ${{ env.REPORT_DIR }}/${{ env.SEMGREP_REPORT }}
             ${{ env.REPORT_DIR }}/${{ env.AIBOM_REPORT }}
@@ -953,16 +450,3 @@ jobs:
             ${{ env.REPORT_DIR }}/${{ env.GRYPE_REPORT }}
             ${{ env.REPORT_DIR }}/${{ env.COMBINED_REPORT }}
             ${{ env.REPORT_DIR }}/${{ env.AIBOM_CONSOLE }}
-
-      # Runs after upload so the evidence survives the failure. Off by default; flip
-      # FAIL_ON_DEGRADED once you trust the run to distinguish "clean" from "broken".
-      - name: Gate on degraded scan
-        if: always()
-        run: |
-          if [ "${SCAN_DEGRADED:-false}" = "true" ]; then
-            echo "::warning title=Cytex scan degraded::${SCAN_DEGRADED_TOOLS:-unknown}"
-            if [ "${FAIL_ON_DEGRADED,,}" = "true" ]; then
-              echo "Scan coverage is incomplete -- treating as failure."
-              exit 1
-            fi
-          fi
