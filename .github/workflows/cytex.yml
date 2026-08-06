@@ -29,15 +29,14 @@ jobs:
       AIBOM_CONSOLE: aibom_console.txt
       AIBOM_VERSION: 1.0.9
       AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
-      # provider is "openai", not "groq": cisco-aibom's build_chat_model strips a
-      # "provider/" prefix from --llm-model whenever it matches --llm-provider
-      # (aibom/llm_factory.py) -- fine for every other model, but Groq's own two
-      # compound models require the "groq/" prefix to be sent to the API verbatim.
-      # Routing through the "openai" provider + a Groq base_url sidesteps that
-      # stripping (mismatched prefix = kept as-is) while still hitting Groq's
-      # OpenAI-compatible endpoint with the Groq key.
-      AIBOM_LLM_PROVIDER: openai
-      AIBOM_LLM_API_BASE: https://api.groq.com/openai/v1
+      # Groq model ids carry a vendor namespace ("openai/gpt-oss-120b") that must reach the
+      # API intact. cisco-aibom's build_chat_model strips a "provider/" prefix from
+      # --llm-model only when it MATCHES --llm-provider (aibom/llm_factory.py), so provider
+      # must NOT be "openai" here -- that would strip "openai/" and send the unknown id
+      # "gpt-oss-120b". With provider "groq" the prefix does not match and is kept verbatim,
+      # and langchain-groq (installed above) supplies the binding, so no --llm-api-base
+      # override is needed: ChatGroq already targets https://api.groq.com/openai/v1.
+      AIBOM_LLM_PROVIDER: groq
       AIBOM_LLM_MODEL: openai/gpt-oss-120b
       AIBOM_FAST_MODEL: openai/gpt-oss-20b
     steps:
@@ -48,9 +47,12 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          # cisco-aibom[all] pulls in the [security] extra, which already declares
+          # cisco-ai-mcp-scanner>=4.8.1 and cisco-ai-skill-scanner>=2.0.12 -- so the
+          # mcp-scanner and skill-scanner binaries come from this one install. semgrep stays
+          # on pipx because its pinned dependency set conflicts with the aibom environment.
           python3 -m pip install --quiet --pre "cisco-aibom[all]==$AIBOM_VERSION" langchain-groq
           pipx install --force semgrep
-          pipx install --force cisco-ai-mcp-scanner
           mkdir -p ~/.aibom/catalogs
           curl -sSfL -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
           echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
@@ -98,17 +100,50 @@ jobs:
           semgrep --config=auto "$SCAN_DIR" --json | tee "$REPORT_DIR/$SEMGREP_REPORT" > /dev/null
           SEMGREP_STATUS=${PIPESTATUS[0]}
 
+          # Preflight the model ids against the key's own catalogue. Agentic failures only
+          # surface ~70s into enrichment as a wall of 404s, by which point the BOM is already
+          # deterministic-only; this reports the mismatch up front and prints the ids the key
+          # can actually use. Advisory only -- never blocks the scan.
+          curl -sS --max-time 30 https://api.groq.com/openai/v1/models \
+            -H "Authorization: Bearer $AIBOM_LLM_API_KEY" -o /tmp/groq_models.json
+          python3 - <<'PREFLIGHT' | tee "$REPORT_DIR/$AIBOM_CONSOLE"
+          import json, os
+          wanted = [os.environ.get("AIBOM_LLM_MODEL", ""), os.environ.get("AIBOM_FAST_MODEL", "")]
+          try:
+              ids = {m["id"] for m in json.load(open("/tmp/groq_models.json")).get("data") or []}
+          except Exception as exc:
+              print("LLM preflight: could not list models (%s) -- continuing" % exc)
+          else:
+              missing = [m for m in wanted if m not in ids]
+              if missing:
+                  print("LLM preflight FAILED: %s not available to this key." % ", ".join(missing))
+                  print("LLM preflight: available ids: %s" % ", ".join(sorted(ids)))
+              else:
+                  print("LLM preflight OK: %s" % ", ".join(wanted))
+          PREFLIGHT
+
+          # tee -a: the preflight verdict above is the first thing in the console log, and
+          # the compliance-table parser reads the whole file, so the extra lines are inert.
           timeout 600 cisco-aibom analyze "$SCAN_DIR" \
             -o cyclonedx -O "$REPORT_DIR/$AIBOM_REPORT" \
             --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" --llm-api-key "$AIBOM_LLM_API_KEY" \
-            --llm-api-base "$AIBOM_LLM_API_BASE" \
             --agentic-fast-model "$AIBOM_FAST_MODEL" --severity info --agentic-review-secrets \
             --agentic-batch-size 3 --agentic-concurrency 1 --agentic-timeout 120 \
-            --compliance all --timing --validate --show-summary 2>&1 | tee "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
+            --compliance all --timing --validate --show-summary 2>&1 | tee -a "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
           AIBOM_STATUS=${PIPESTATUS[0]}
 
-          skill-scanner scan-all "$SCAN_DIR" --recursive --lenient --format json --output-json "$REPORT_DIR/$SKILLS_REPORT"
+          # No --lenient: it adds a second discovery phase that treats ANY directory holding
+          # a .md file as a candidate skill, so every repo with a README scans as a "skill"
+          # and reports findings against ordinary docs. Strict discovery matches only real
+          # agent skills (a directory with SKILL.md), found anywhere via --recursive.
+          # Malformed skills are then reported under skills_skipped rather than scanned.
+          skill-scanner scan-all "$SCAN_DIR" --recursive --format json --output-json "$REPORT_DIR/$SKILLS_REPORT"
           SKILLS_STATUS=$?
+          # "No skills found to scan." exits 1 without writing a report -- a repo with no
+          # agent skills is a normal outcome, not a tool failure.
+          if [ "$SKILLS_STATUS" != "0" ] && [ ! -s "$REPORT_DIR/$SKILLS_REPORT" ]; then
+            SKILLS_STATUS=no-skills
+          fi
 
           MCP_CONFIG=""
           for name in mcp.json .mcp.json mcp_config.json claude_desktop_config.json cline_mcp_settings.json; do
@@ -250,10 +285,20 @@ jobs:
                   return "llm_endpoint" if name.startswith("env:") else "model"
               return "other"
 
+          # CycloneDX "type" is a closed enum (application/library/data/...) with no member
+          # for agent, prompt, guardrail, tool, retriever and the rest, so it collapses all
+          # 26 categories into 5 values -- 16 of them into a single "application". The
+          # category therefore lives in the cisco-aibom:type property, and is lifted to a
+          # top-level "category" key alongside "_source" so consumers can group components
+          # without walking properties[]. Both are written: the property keeps the document
+          # valid CycloneDX for external tools, the key keeps it cheap for the ingester.
           for component in aibom.get("components") or []:
-              if not prop(component, "cisco-aibom:type"):
+              category = prop(component, "cisco-aibom:type")
+              if not category:
+                  category = aibom_category(component)
                   component.setdefault("properties", []).append(
-                      {"name": "cisco-aibom:type", "value": aibom_category(component)})
+                      {"name": "cisco-aibom:type", "value": category})
+              component["category"] = category
 
           # Secrets stay in vulnerabilities[] -- that is where the findings view reads them
           # -- and are mirrored into components[] so the inventory is complete.
@@ -267,6 +312,7 @@ jobs:
                   "name": secret_id[len(SECRET_ID_PREFIX):] or "secret",
                   "description": str(vulnerability.get("description") or "Detected secret"),
                   "properties": list(vulnerability.get("properties") or []),
+                  "category": "secret",
               })
 
           combined = dict(aibom) if aibom else {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [], "metadata": {}}
@@ -289,17 +335,21 @@ jobs:
                   combined.setdefault("vulnerabilities", []).append(dict(cve, _source="aibom"))
 
           # Skills merge like every other detector: inventory -> components[], findings ->
-          # vulnerabilities[], tagged _source "skills".
-          for result in norm(load("skills").get("results") or []):
+          # vulnerabilities[], tagged _source "skills". "file" is the CycloneDX type
+          # cisco-aibom's own reporter maps SKILL to (_cyclonedx_component_type); "skill" is
+          # not a member of the CycloneDX type enum and would fail --validate.
+          skills_doc = load("skills")
+          for result in norm(skills_doc.get("results") or []):
               name = (str(result.get("skill_name") or "") or os.path.basename(str(result.get("skill_path", "")))
                       or os.environ.get("REPO", "").split("/")[-1])
               skill_ref = "agent-skill-" + name.replace(" ", "-") if name else "agent-skill-root"
               combined.setdefault("components", []).append({
-                  "type": "skill",
+                  "type": "file",
                   "bom-ref": skill_ref,
                   "name": name,
                   "version": "",
                   "_source": "skills",
+                  "category": "skill",
                   "properties": [
                       {"name": "skill:Path", "value": str(result.get("skill_path", ""))},
                       {"name": "skill:IsSafe", "value": str(result.get("is_safe", ""))},
@@ -384,10 +434,11 @@ jobs:
           # OS/language packages). Matches the category counts cisco-aibom prints to console.
           aibom_categories = {}
           for component in combined.get("components") or []:
-              if not isinstance(component, dict) or component.get("_source") not in ("aibom", "skills"):
+              if not isinstance(component, dict):
                   continue
-              category = prop(component, "cisco-aibom:type") or ("skill" if component.get("_source") == "skills" else "other")
-              aibom_categories[category] = aibom_categories.get(category, 0) + 1
+              category = component.get("category")
+              if category:
+                  aibom_categories[category] = aibom_categories.get(category, 0) + 1
           aibom_categories = dict(sorted(aibom_categories.items()))
 
           combined["semgrep"] = {"results": findings, "severityCounts": sast_counts}
@@ -409,6 +460,9 @@ jobs:
                   "aibomComponents": sum(aibom_categories.values()),
                   "aibomCategories": aibom_categories,
                   "skillComponents": len([c for c in combined.get("components") or [] if isinstance(c, dict) and c.get("_source") == "skills"]),
+                  # Strict discovery skips skills whose metadata will not load; record them
+                  # so a real-but-malformed skill is visible rather than silently absent.
+                  "skillsSkipped": norm((skills_doc.get("summary") or {}).get("skills_skipped") or []),
                   "skillFindings": len([v for v in combined.get("vulnerabilities") or [] if isinstance(v, dict) and v.get("_source") == "skills"]),
                   "mcpFindings": len([v for v in combined.get("vulnerabilities") or [] if isinstance(v, dict) and v.get("_source") == "mcp"]),
                   "dependencies": len(combined.get("dependencies") or []),
