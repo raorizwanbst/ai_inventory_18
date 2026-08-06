@@ -124,13 +124,35 @@ jobs:
 
           # tee -a: the preflight verdict above is the first thing in the console log, and
           # the compliance-table parser reads the whole file, so the extra lines are inert.
-          timeout 600 cisco-aibom analyze "$SCAN_DIR" \
+          #
+          # Throughput budget: enrichment sends every component to the LLM, so wall time is
+          # (components / batch-size) / concurrency * per-batch latency. batch-size 3 +
+          # concurrency 1 meant ~66 strictly serial calls for a 200-component repo, which
+          # overran the outer timeout and lost the whole BOM (timeout kills the process
+          # before the report is written -- a timeout costs the deterministic components
+          # too, not just the enrichment). 8/4 cuts that to ~25 calls, 4 in flight.
+          # --agentic-rate-limit is left at its 1.0 req/s default: raising it risks 429s,
+          # and at this batch count the limiter is not the bottleneck.
+          timeout 1800 cisco-aibom analyze "$SCAN_DIR" \
             -o cyclonedx -O "$REPORT_DIR/$AIBOM_REPORT" \
             --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" --llm-api-key "$AIBOM_LLM_API_KEY" \
             --agentic-fast-model "$AIBOM_FAST_MODEL" --severity info --agentic-review-secrets \
-            --agentic-batch-size 3 --agentic-concurrency 1 --agentic-timeout 120 \
+            --agentic-batch-size 8 --agentic-concurrency 4 --agentic-timeout 120 \
             --compliance all --timing --validate --show-summary 2>&1 | tee -a "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
           AIBOM_STATUS=${PIPESTATUS[0]}
+
+          # Enrichment is best-effort; the component inventory is not. Any hard stop above
+          # (timeout 124, provider outage, OOM) leaves no report at all, which silently drops
+          # ~120 AI components that need no LLM to find. Re-run deterministically in that
+          # case: omitting --llm-model makes cisco-aibom skip the agentic stage entirely.
+          if [ ! -s "$REPORT_DIR/$AIBOM_REPORT" ]; then
+            echo "AIBOM produced no report (status $AIBOM_STATUS) -- retrying deterministic-only" \
+              | tee -a "$REPORT_DIR/$AIBOM_CONSOLE"
+            timeout 300 cisco-aibom analyze "$SCAN_DIR" \
+              -o cyclonedx -O "$REPORT_DIR/$AIBOM_REPORT" --severity info \
+              --compliance all --timing --validate --show-summary 2>&1 | tee -a "$REPORT_DIR/$AIBOM_CONSOLE" > /dev/null
+            AIBOM_STATUS="$AIBOM_STATUS/deterministic-${PIPESTATUS[0]}"
+          fi
 
           # No --lenient: it adds a second discovery phase that treats ANY directory holding
           # a .md file as a candidate skill, so every repo with a README scans as a "skill"
